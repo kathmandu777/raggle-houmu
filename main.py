@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import requests
@@ -62,21 +63,56 @@ def load_pdf(pdf_url: str) -> Document:
         )
 
 
-def retrieve_documents_by_title(title: str) -> list[Document]:
-    documents = []
-    for pdf_url in pdf_file_urls:
-        documents.append(load_pdf(pdf_url))
-    return [doc for doc in documents if doc.metadata["title"] == title]
+def retrieve_documents(question: str) -> list[Document]:
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(load_pdf, pdf_file_urls))
+    titles = [doc.metadata["title"] for doc in results]
+
+    openai = ChatOpenAI(model=model, temperature=0.0)
+    messages = [
+        (
+            "system",
+            (
+                "あなたは法律の専門家です。質問に関連する契約書のタイトルを候補の中から全て選び、リストで出力してください。"
+                "出力は、リストのタイトルを','で区切ったものを出力してください。\n"
+                "契約書1,契約書2,契約書3"
+            ),
+        ),
+        (
+            "user",
+            (
+                f"【質問】{question}\n"
+                "【契約書のタイトルの候補】\n"
+                f"{','.join(titles)}"
+            ),
+        ),
+    ]
+    related_doc_titles = openai.invoke(messages).content
+    related_doc_titles = related_doc_titles.split(",")
+    return [doc for doc in results if doc.metadata["title"] in related_doc_titles]
 
 
 # 回答を生成する関数
 def generate_answer(question: str, context_text: str) -> str:
     openai = ChatOpenAI(model=model, temperature=0.0)
-    prompt = f"Answer the following question based on the provided context:\n\nContext:\n{context_text}\n\nQuestion: {question}"
+    prompt = f"【コンテキスト】\n{context_text}\n\n【質問】{question}"
     messages = [
         (
             "system",
-            "あなたは優秀な法律の専門家です。与えられる契約資料に基づき、ユーザーの質問に丁寧かつわかりやすく回答してください。",
+            (
+                "あなたは法律の専門家です。"
+                "ユーザーの質問には、可能な限り具体的かつ簡潔・端的な回答を、ユーザーが理解しやすいテキスト形式で提供してください。（マークダウン形式にしないこと！）"
+                "また、与えられたコンテキストのみでは、生成する回答の正確性に不安がある場合はその旨を明示してください。コンテキストにない情報については、勝手に補ってはいけません。"
+                "あなたの回答は、correctness, helpfulness, conciseness, harmlessnessで評価されることを覚えておいてください。\n"
+                "回答の例を以下に示します。\n"
+                "-----\n"
+                "【質問】ソフトウェア開発業務委託契約について、委託料の金額はいくらですか？\n"
+                "【回答】委託料の金額は金五百万円（税別）です。\n"
+                "-----\n"
+                "【質問】コールセンター業務委託契約における請求書の発行プロセスについて、締め日と発行期限を具体的に説明してください。\n"
+                "【回答】受託者は毎月末日に締め、翌月5日までに請求書を発行する。\n"
+                "-----\n"
+            ),
         ),
         ("user", prompt),
     ]
@@ -86,16 +122,7 @@ def generate_answer(question: str, context_text: str) -> str:
 
 # RAGパイプラインの実装
 def rag_implementation(question: str) -> str:
-    # questionから「XX契約」「XX契約書」を抽出
-    related_doc_titles = [
-        title.replace("契約", "")
-        for title in re.findall(r"(\S+契約)", question.replace(" ", ""))
-    ]
-
-    context_docs = []
-    for title in related_doc_titles:
-        context_docs.extend(retrieve_documents_by_title(title))
-
+    context_docs = retrieve_documents(question)
     context_text = "\n\n".join([doc.page_content for doc in context_docs])
     answer = generate_answer(question, context_text)
     # print(answer)
